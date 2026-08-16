@@ -21,6 +21,12 @@
 
 #include "Config.h"
 
+// 渲染器 exe 文件名，由顶层 CMakeLists.txt 按 $<TARGET_FILE_NAME:Main> 注入；
+// 单独编译本文件时退回默认名
+#if !defined(HIKALI_RENDERER_EXE_NAME)
+#   define HIKALI_RENDERER_EXE_NAME "Main.exe"
+#endif
+
 // ---------- D3D11 全局状态 ----------
 static ID3D11Device*            g_pd3dDevice            = nullptr;
 static ID3D11DeviceContext*     g_pd3dDeviceContext     = nullptr;
@@ -186,9 +192,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     wchar_t selfPath[MAX_PATH];
     GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
     const std::filesystem::path launcherDir  = std::filesystem::path(selfPath).parent_path();
-    const std::filesystem::path rendererPath = launcherDir / L"Hikali.exe";
+    const std::filesystem::path rendererPath = launcherDir / HIKALI_RENDERER_EXE_NAME;
 
     std::wstring launchStatus;
+    HANDLE       rendererProcess = nullptr;   // 非空表示渲染器正在运行
 
     // ---------- 主循环 ----------
     bool done = false;
@@ -220,6 +227,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = g_ResizeHeight = 0;
             CreateRenderTarget();
+        }
+
+        // 轮询渲染器是否已退出（非阻塞）。渲染器启动即崩时能在此看到退出码，
+        // 否则进程一闪而过、界面上只留“已启动”会看不出问题
+        if (rendererProcess != nullptr &&
+            WaitForSingleObject(rendererProcess, 0) == WAIT_OBJECT_0)
+        {
+            DWORD exitCode = 0;
+            GetExitCodeProcess(rendererProcess, &exitCode);
+            CloseHandle(rendererProcess);
+            rendererProcess = nullptr;
+
+            if (exitCode == 0)
+                launchStatus = L"渲染器已正常退出。";
+            else
+            {
+                wchar_t buf[160];
+                swprintf_s(buf, L"渲染器异常退出（退出码 %lu），详见渲染器窗口的错误提示。",
+                           (unsigned long)exitCode);
+                launchStatus = buf;
+            }
         }
 
         // ---------- 绘制配置界面 ----------
@@ -259,10 +287,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
         ImGui::Separator();
 
         // 启动按钮：写 JSON → CreateProcess 启动渲染器
-        if (ImGui::Button("启动渲染器", ImVec2(-1.0f, 44.0f)))
+        // 渲染器在跑时禁用，避免重复拉起（全屏时新窗口会盖住旧窗口，不易察觉）
+        const bool rendererRunning = (rendererProcess != nullptr);
+        ImGui::BeginDisabled(rendererRunning);
+        if (ImGui::Button(rendererRunning ? "渲染器运行中…" : "启动渲染器", ImVec2(-1.0f, 44.0f)))
         {
-            if (SaveRenderConfigToFile(cfgPath, cfg))
+            launchStatus.clear();
+
+            if (!SaveRenderConfigToFile(cfgPath, cfg))
             {
+                launchStatus = L"写入配置文件失败：" + cfgPath.wstring();
+            }
+            else if (std::error_code existsEc; !std::filesystem::exists(rendererPath, existsEc))
+            {
+                // 先查文件在不在：比拿到 CreateProcess 的错误码更直观
+                launchStatus = L"找不到渲染器程序：" + rendererPath.wstring() +
+                               L"\n请先构建 Main 目标。";
+            }
+            else
+            {
+                // lpApplicationName 已给出确切 exe，命令行里 argv[0] 仍需带上并加引号
                 std::wstring cmdLine = L"\"" + rendererPath.wstring() +
                                        L"\" --config \"" + cfgPath.wstring() + L"\"";
                 STARTUPINFOW si{};
@@ -273,22 +317,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
                                    launcherDir.c_str(), &si, &pi))
                 {
                     CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                    launchStatus = L"已启动渲染器：" + rendererPath.wstring();
+                    rendererProcess = pi.hProcess;   // 留着轮询退出状态，退出时再关
+                    launchStatus = L"已启动渲染器：" + rendererPath.filename().wstring() +
+                                   L"（PID " + std::to_wstring(pi.dwProcessId) + L"）";
                 }
                 else
                 {
-                    wchar_t buf[160];
-                    swprintf_s(buf, L"启动失败（错误码 %lu）。请确认 Hikali.exe 与启动器在同一目录。",
-                               (unsigned long)GetLastError());
+                    wchar_t buf[200];
+                    swprintf_s(buf, L"启动失败（错误码 %lu）：%ls",
+                               (unsigned long)GetLastError(), rendererPath.c_str());
                     launchStatus = buf;
                 }
             }
-            else
-            {
-                launchStatus = L"写入配置文件失败。";
-            }
         }
+        ImGui::EndDisabled();
 
         if (!launchStatus.empty())
             ImGui::TextWrapped("%ls", launchStatus.c_str());
@@ -308,6 +350,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
     }
 
     // ---------- 清理 ----------
+    // 只关句柄，不结束进程：启动器先退出时渲染器应继续运行
+    if (rendererProcess != nullptr)
+        CloseHandle(rendererProcess);
+
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
